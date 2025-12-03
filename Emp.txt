@@ -1,0 +1,222 @@
+import pandas as pd
+from datetime import timedelta
+
+# =========================
+# 1. Load data
+# =========================
+
+# If you are running as "Python in Excel", you can replace this with:
+# df = xl("SheetName!A1:G42001")  # for example
+# For normal Python, read from file:
+df = pd.read_excel("key_exchange_42000_sorted.xlsx")  # <- change path if needed
+
+# Ensure correct dtypes
+df["Date"] = pd.to_datetime(df["Date"])
+df["Employee"] = df["FirstName"].astype(str) + " " + df["LastName"].astype(str)
+
+# Sort like a real log
+df = df.sort_values(["KeyID", "Date", "EventID"]).reset_index(drop=True)
+
+
+# =========================
+# 2. Build cycles per key
+#    (pickup + dropoff pair)
+# =========================
+
+cycles = []
+
+open_pickup = {}  # keyID -> row (dict / Series)
+
+for _, row in df.iterrows():
+    key = row["KeyID"]
+    emp = row["Employee"]
+    time = row["Date"]
+    keyname = row["KeyName"]
+    typ = row["Type"]
+
+    if typ == "PICKUP":
+        # If there is already an open pickup, close it as a pickup-only cycle
+        if key in open_pickup and open_pickup[key] is not None:
+            p = open_pickup[key]
+            cycles.append({
+                "KeyID": key,
+                "KeyName": keyname,
+                "pickup_time": p["Date"],
+                "pickup_employee": p["Employee"],
+                "dropoff_time": pd.NaT,
+                "dropoff_employee": None,
+            })
+        # New open pickup
+        open_pickup[key] = row
+
+    elif typ == "DROPOFF":
+        if key in open_pickup and open_pickup[key] is not None:
+            # Normal cycle: match existing pickup with this dropoff
+            p = open_pickup[key]
+            cycles.append({
+                "KeyID": key,
+                "KeyName": keyname,
+                "pickup_time": p["Date"],
+                "pickup_employee": p["Employee"],
+                "dropoff_time": time,
+                "dropoff_employee": emp,
+            })
+            open_pickup[key] = None
+        else:
+            # Dropoff with no pickup before -> dropoff-only cycle
+            cycles.append({
+                "KeyID": key,
+                "KeyName": keyname,
+                "pickup_time": pd.NaT,
+                "pickup_employee": None,
+                "dropoff_time": time,
+                "dropoff_employee": emp,
+            })
+
+# Any pickups left open at the end -> pickup-only cycles
+for key, p in open_pickup.items():
+    if p is not None:
+        cycles.append({
+            "KeyID": key,
+            "KeyName": p["KeyName"],
+            "pickup_time": p["Date"],
+            "pickup_employee": p["Employee"],
+            "dropoff_time": pd.NaT,
+            "dropoff_employee": None,
+        })
+
+cycles_df = pd.DataFrame(cycles)
+
+# Usage hours (only when both timestamps exist)
+cycles_df["usage_hours"] = (
+    (cycles_df["dropoff_time"] - cycles_df["pickup_time"])
+    .dt.total_seconds() / 3600
+)
+
+
+# =========================
+# 3. TABLE 1 – per-employee stats
+# =========================
+
+# --- Full cycles: same employee picks up and drops off and both times exist ---
+full_mask = (
+    cycles_df["pickup_employee"].notna()
+    & cycles_df["dropoff_employee"].notna()
+    & (cycles_df["pickup_employee"] == cycles_df["dropoff_employee"])
+)
+
+full_cycles = cycles_df[full_mask]
+
+# Count full cycles and usage hours per employee
+full_stats = (
+    full_cycles
+    .groupby("pickup_employee")["usage_hours"]
+    .agg(full_cycle_count="count",
+         total_usage_hours="sum")
+)
+
+full_stats["mean_usage_hours"] = (
+    full_stats["total_usage_hours"] / full_stats["full_cycle_count"]
+)
+
+
+# --- Incomplete cycles for each employee ---
+# A cycle is incomplete for an employee when they only did pickup OR only did dropoff
+
+# employee as pickup only (dropoff different or missing)
+pickup_incomplete = cycles_df[
+    cycles_df["pickup_employee"].notna()
+    & (
+        cycles_df["dropoff_employee"].isna()
+        | (cycles_df["pickup_employee"] != cycles_df["dropoff_employee"])
+    )
+].groupby("pickup_employee").size()
+
+# employee as dropoff only (pickup different or missing)
+dropoff_incomplete = cycles_df[
+    cycles_df["dropoff_employee"].notna()
+    & (
+        cycles_df["pickup_employee"].isna()
+        | (cycles_df["pickup_employee"] != cycles_df["dropoff_employee"])
+    )
+].groupby("dropoff_employee").size()
+
+# total incomplete per employee
+incomplete_counts = pickup_incomplete.add(dropoff_incomplete, fill_value=0)
+incomplete_counts = incomplete_counts.rename("incomplete_cycle_count")
+
+# --- Combine to table 1 ---
+
+table1 = (
+    full_stats
+    .join(incomplete_counts, how="outer")
+    .fillna({"full_cycle_count": 0,
+             "total_usage_hours": 0,
+             "mean_usage_hours": 0,
+             "incomplete_cycle_count": 0})
+    .reset_index()
+    .rename(columns={"pickup_employee": "Employee"})
+)
+
+# Optional: sort by employee or by full_cycle_count
+table1 = table1.sort_values("Employee")
+
+print("TABLE 1 – Per-employee summary")
+print(table1.head())
+
+
+# =========================
+# 4. TABLE 2 – incomplete cycles for a specific employee
+# =========================
+
+def get_incomplete_cycles_for_employee(cycles_df, employee_name):
+    """
+    Return all incomplete cycles for a given employee, with the name
+    of the person who ended the cycle (dropoff employee, if any).
+    """
+    c = cycles_df.copy()
+
+    # Mask where employee appears as pickup but not as dropoff in that cycle
+    pick_mask = (
+        (c["pickup_employee"] == employee_name)
+        & (
+            c["dropoff_employee"].isna()
+            | (c["dropoff_employee"] != employee_name)
+        )
+    )
+
+    # Mask where employee appears as dropoff but not as pickup in that cycle
+    drop_mask = (
+        (c["dropoff_employee"] == employee_name)
+        & (
+            c["pickup_employee"].isna()
+            | (c["pickup_employee"] != employee_name)
+        )
+    )
+
+    incomplete = c[pick_mask | drop_mask].copy()
+
+    # Role of the employee in that cycle
+    incomplete["EmployeeRole"] = None
+    incomplete.loc[pick_mask, "EmployeeRole"] = "PICKUP_ONLY"
+    incomplete.loc[drop_mask, "EmployeeRole"] = "DROPOFF_ONLY"
+
+    # Person who ended the cycle = dropoff employee (could be NaN if never dropped)
+    incomplete["EndingEmployee"] = incomplete["dropoff_employee"]
+
+    # Select useful columns
+    cols = [
+        "KeyID", "KeyName",
+        "pickup_time", "pickup_employee",
+        "dropoff_time", "dropoff_employee",
+        "EmployeeRole", "EndingEmployee"
+    ]
+    return incomplete[cols].sort_values("pickup_time").reset_index(drop=True)
+
+
+# Example usage for one employee:
+employee_name = "First1 Last1"   # <<< put the actual name here
+table2 = get_incomplete_cycles_for_employee(cycles_df, employee_name)
+
+print("\nTABLE 2 – Incomplete cycles for:", employee_name)
+print(table2.head())
